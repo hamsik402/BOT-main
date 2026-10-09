@@ -1,0 +1,30 @@
+[package]
+name = "feed-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true }
+config = { path = "../config" }
+dex = { path = "../dex" }
+env_logger = "0.11.6"
+futures-util = "0.3.31"
+log = { workspace = true }
+reqwest = "0.12.12"
+serde_json = { workspace = true }
+solana-program = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.20.1", features = ["rustls-tls-webpki-roots"] }
+utils = { path = "../utils" }
+yellowstone-grpc-client = "6.1.0"
+yellowstone-grpc-proto = "6.1.0"
+zmq2 = { workspace = true }
+
+# Not used directly: turn off the program entrypoints these crates export, otherwise the binary
+# fails to link with "multiple definition of `entrypoint'".
+spl-associated-token-account = { version = "=6.0.0", features = ["no-entrypoint"] }
+spl-token-2022-v6 = { package = "spl-token-2022", version = "=6.0.0", features = ["no-entrypoint"] }
+spl-token-2022-v7 = { package = "spl-token-2022", version = "=7.0.0", features = ["no-entrypoint"] }
+spl-token-2022-v8 = { package = "spl-token-2022", version = "=8.0.1", features = ["no-entrypoint"] }

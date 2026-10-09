@@ -1,0 +1,22 @@
+/target
+.idea
+.vscode
+.env
+bin
+/tables
+tables
+*.log
+.lapce
+tmp/invariant_interface
+scripts/arb_monitor.toml
+.claude/settings.local.json
+perf.data
+.DS_Store
+/arb-bot/src/providers/target
+
+# Python / Node
+node_modules/
+venv/
+.venv/
+__pycache__/
+graphify-out/
