@@ -2,6 +2,9 @@
 //! (see `arb_core::direct`). Each opportunity is quoted again for `[direct] amount`, simulated, and
 //! sent only when the simulation succeeds; the last swap's minimum output makes any transaction
 //! that would not end with a profit fail on chain.
+//!
+//! Transactions go to `send_rpc` and every `send_rpcs` at once, and/or to a Jito block engine as
+//! one-transaction bundles (`jito_url`), the Jito tip being the last instruction of the transaction.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -14,6 +17,7 @@ use arb_core::arbitrage::OpportunityWithCalculators;
 use arb_core::calculator::get_pubkeys;
 use arb_core::direct::{build_direct_route, DirectRoute};
 use config::CONFIG as cfg;
+use jito_searcher_client::tip::get_jito_random_address;
 use log::{debug, info, warn};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
@@ -23,6 +27,7 @@ use solana_sdk::hash::Hash;
 use solana_sdk::message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
+use solana_sdk::system_instruction;
 use solana_sdk::transaction::VersionedTransaction;
 use spl_associated_token_account::get_associated_token_address;
 use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
@@ -44,6 +49,10 @@ const BALANCE_INTERVAL: Duration = Duration::from_secs(5);
 /// Sent transactions are checked after this delay.
 const STATUS_DELAY: Duration = Duration::from_secs(20);
 const MAX_COMPUTE_UNITS: u32 = 1_400_000;
+/// Compute units of the SOL transfer tipping Jito.
+const JITO_TIP_COMPUTE_UNITS: u32 = 1_000;
+/// Jito refuses bundles tipping less than this, in lamports.
+const JITO_MIN_TIP: u64 = 1_000;
 
 /// Spaces calls so that at most `per_second` happen per second.
 struct RateLimiter {
@@ -66,6 +75,59 @@ impl RateLimiter {
             tokio::time::sleep_until(*next).await;
         }
         *next = (*next).max(now) + self.interval;
+    }
+
+    /// Takes a slot only if one is free right now.
+    fn try_take(&self) -> bool {
+        let Ok(mut next) = self.next.try_lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if *next > now {
+            return false;
+        }
+        *next = now + self.interval;
+        true
+    }
+}
+
+/// Sends transactions to a Jito block engine as one-transaction bundles, over its JSON-RPC API.
+struct JitoSender {
+    client: reqwest::Client,
+    url: String,
+}
+
+impl JitoSender {
+    fn new(block_engine: &str) -> Self {
+        JitoSender {
+            client: reqwest::Client::new(),
+            url: format!("{}/api/v1/bundles", block_engine.trim_end_matches('/')),
+        }
+    }
+
+    /// Returns the bundle id.
+    async fn send(&self, transaction: &VersionedTransaction) -> anyhow::Result<String> {
+        let encoded = utils::base64::b64_encode(check_transaction_size(transaction)?);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [[encoded], {"encoding": "base64"}],
+        });
+        let response = self
+            .client
+            .post(&self.url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        match value.get("result").and_then(|result| result.as_str()) {
+            Some(bundle_id) => Ok(bundle_id.to_string()),
+            None => anyhow::bail!("{status} {}", value.get("error").map(|e| e.to_string()).unwrap_or(text)),
+        }
     }
 }
 
@@ -134,6 +196,10 @@ struct Stats {
     simulation_errors: BTreeMap<String, u64>,
     sent: u64,
     send_errors: u64,
+    jito_sent: u64,
+    jito_errors: u64,
+    /// Simulated successfully but not sent to Jito because of its rate limit.
+    jito_rate_limited: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +278,15 @@ impl Provider for ProviderDirect {
         let simulate_only = direct.simulate_only || matches!(payer, Payer::SimulatedAs(_));
         let rpc_url = if direct.rpc.is_empty() { cfg.rpc.clone() } else { direct.rpc.clone() };
         let send_url = if direct.send_rpc.is_empty() { rpc_url.clone() } else { direct.send_rpc.clone() };
+        let mut send_urls = vec![send_url];
+        for url in direct.send_rpcs.iter().filter(|url| !url.is_empty()) {
+            if !send_urls.contains(url) {
+                send_urls.push(url.clone());
+            }
+        }
+        let use_jito = !direct.jito_url.is_empty();
+        assert!(use_jito || !direct.jito_only, "[direct] jito_only needs jito_url");
+        assert!(!use_jito || direct.jito_tip >= JITO_MIN_TIP, "[direct] jito_tip must be at least {JITO_MIN_TIP} lamports");
         let owner = payer.pubkey();
         info!(
             "Direct provider: wallet {owner}, amount {} lamports, min profit {}, {}",
@@ -219,12 +294,26 @@ impl Provider for ProviderDirect {
             direct.min_profit,
             if simulate_only { "SIMULATION ONLY" } else { "SENDING TRANSACTIONS" }
         );
+        info!(
+            "Direct provider: sending to {}{}",
+            if direct.jito_only { "no RPC".to_string() } else { format!("{} RPC(s)", send_urls.len()) },
+            if use_jito {
+                format!(", Jito {} (tip {} lamports, {}/s)", direct.jito_url, direct.jito_tip, direct.jito_sends_per_second)
+            } else {
+                String::new()
+            }
+        );
 
         let runtime = tokio::runtime::Runtime::new().expect("Failed to create the direct provider runtime");
         runtime.spawn(async move {
             let rpc = Arc::new(RpcClient::new_with_commitment(rpc_url, CommitmentConfig::processed()));
             let lookup_tables = load_lookup_tables(&rpc, &direct.lookup_tables).await;
-            let send_rpc = Arc::new(RpcClient::new_with_commitment(send_url, CommitmentConfig::processed()));
+            let send_rpcs: Vec<RpcClient> = send_urls
+                .into_iter()
+                .map(|url| RpcClient::new_with_commitment(url, CommitmentConfig::processed()))
+                .collect();
+            let jito = use_jito.then(|| JitoSender::new(&direct.jito_url));
+            let jito_limiter = RateLimiter::new(direct.jito_sends_per_second);
             let rpc_limiter = Arc::new(RateLimiter::new(direct.rpc_requests_per_second));
             let send_limiter = RateLimiter::new(direct.sends_per_second);
             let stopped = Arc::new(AtomicBool::new(false));
@@ -276,9 +365,10 @@ impl Provider for ProviderDirect {
                         );
                         info!(
                             "Direct stats (1 min): {} opportunities, {} with transfer fee tokens, {} below {} lamports expected, build errors {:?}, \
-                             {} too large, simulations ok {} / errors {:?}, sent {} ({} send errors), wallet {} lamports",
+                             {} too large, simulations ok {} / errors {:?}, sent {} ({} RPC send errors; Jito {} sent, {} errors, {} rate limited), wallet {} lamports",
                             stats.opportunities, stats.transfer_fee_tokens, stats.below_threshold, direct.min_expected_profit, stats.build_errors,
                             stats.too_large, stats.simulated_ok, stats.simulation_errors, stats.sent, stats.send_errors,
+                            stats.jito_sent, stats.jito_errors, stats.jito_rate_limited,
                             wallet_balance.load(Ordering::Relaxed),
                         );
                         stats = Stats::default();
@@ -380,20 +470,61 @@ impl Provider for ProviderDirect {
                                 stopped.store(true, Ordering::Relaxed);
                                 continue;
                             }
-                            send_limiter.wait().await;
-                            match send_rpc.send_transaction_with_config(&transaction, RpcSendTransactionConfig {
-                                skip_preflight: true,
-                                ..Default::default()
-                            }).await {
-                                Ok(signature) => {
-                                    stats.sent += 1;
-                                    info!("Direct: SENT {signature}, expected profit {} lamports, pools {:?}", route.expected_profit(), pools);
-                                    let _ = tx_sent.send((signature, route.expected_profit()));
+                            let to_jito = jito.is_some() && jito_limiter.try_take();
+                            if jito.is_some() && !to_jito {
+                                stats.jito_rate_limited += 1;
+                            }
+                            if direct.jito_only && !to_jito {
+                                continue;
+                            }
+                            let jito_send = async {
+                                match &jito {
+                                    Some(jito) if to_jito => Some(jito.send(&transaction).await),
+                                    _ => None,
                                 }
-                                Err(e) => {
-                                    stats.send_errors += 1;
-                                    warn!("Direct: send failed: {e}");
+                            };
+                            let rpc_send = async {
+                                if direct.jito_only {
+                                    return Vec::new();
                                 }
+                                send_limiter.wait().await;
+                                futures::future::join_all(send_rpcs.iter().map(|send_rpc| {
+                                    send_rpc.send_transaction_with_config(&transaction, RpcSendTransactionConfig {
+                                        skip_preflight: true,
+                                        ..Default::default()
+                                    })
+                                }))
+                                .await
+                            };
+                            let (jito_result, rpc_results) = tokio::join!(jito_send, rpc_send);
+                            let rpc_ok = rpc_results.iter().filter(|result| result.is_ok()).count();
+                            for e in rpc_results.iter().filter_map(|result| result.as_ref().err()) {
+                                warn!("Direct: RPC send failed: {e}");
+                            }
+                            if !rpc_results.is_empty() && rpc_ok == 0 {
+                                stats.send_errors += 1;
+                            }
+                            let jito_ok = match jito_result {
+                                Some(Ok(bundle_id)) => {
+                                    stats.jito_sent += 1;
+                                    debug!("Direct: Jito bundle {bundle_id}");
+                                    true
+                                }
+                                Some(Err(e)) => {
+                                    stats.jito_errors += 1;
+                                    warn!("Direct: Jito send failed: {e:#}");
+                                    false
+                                }
+                                None => false,
+                            };
+                            if rpc_ok > 0 || jito_ok {
+                                let signature = transaction.signatures[0];
+                                stats.sent += 1;
+                                info!(
+                                    "Direct: SENT {signature} (RPC {rpc_ok}/{}, Jito {}), expected profit {} lamports, pools {:?}",
+                                    rpc_results.len(), if jito_ok { "yes" } else { "no" }, route.expected_profit(), pools
+                                );
+                                let _ = tx_sent.send((signature, route.expected_profit()));
                             }
                         }
                     }
@@ -411,13 +542,19 @@ fn build_transaction(
     blockhash: Hash,
     direct: &config::direct::DirectConfig,
 ) -> anyhow::Result<VersionedTransaction> {
-    let compute_units = (route.compute_units as u64 * (100 + direct.compute_unit_margin_percent as u64) / 100)
+    let jito_tip = !direct.jito_url.is_empty();
+    let route_compute_units = route.compute_units + if jito_tip { JITO_TIP_COMPUTE_UNITS } else { 0 };
+    let compute_units = (route_compute_units as u64 * (100 + direct.compute_unit_margin_percent as u64) / 100)
         .min(MAX_COMPUTE_UNITS as u64) as u32;
     let mut instructions = vec![
         ComputeBudgetInstruction::set_compute_unit_limit(compute_units),
         ComputeBudgetInstruction::set_compute_unit_price(direct.compute_unit_price),
     ];
     instructions.extend(route.instructions.iter().cloned());
+    if jito_tip {
+        // Last instruction: the tip is only paid if every swap before it succeeded.
+        instructions.push(system_instruction::transfer(&payer.pubkey(), &get_jito_random_address(), direct.jito_tip));
+    }
     let message = v0::Message::try_compile(&payer.pubkey(), &instructions, alts, blockhash)?;
     let transaction = payer.transaction(message)?;
     check_transaction_size(&transaction)?;
