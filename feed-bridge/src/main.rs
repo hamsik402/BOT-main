@@ -48,7 +48,11 @@ async fn main() -> anyhow::Result<()> {
         "grpc" => ensure!(!cfg.grpc_url.is_empty(), "[feed_bridge] grpc_url must be set"),
         other => bail!("[feed_bridge] source must be \"ws\" or \"grpc\", not {other:?}"),
     }
-    info!("Account updates from {}", cfg.source);
+    info!(
+        "Account updates from {}{}",
+        cfg.source,
+        if cfg.source == "ws" { format!(" ({} endpoint(s))", 1 + cfg.extra_ws.len()) } else { String::new() }
+    );
 
     let rpc = Arc::new(HttpRpc::new("rpc", &cfg.rpc, cfg.rpc_rps));
 

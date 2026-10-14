@@ -2,6 +2,7 @@
 //! (HTTP snapshot, then WebSocket stream) and publishes every change for arb-bot.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -113,6 +114,12 @@ struct Tracker {
     latest_slot: u64,
     slot_lag_sum: u64,
     slot_lag_max: u64,
+    /// Updates published first, by source; copies of an update already received from another source.
+    first_by_source: Vec<u64>,
+    duplicates: u64,
+    /// Latest slot of each account and the hashes of the versions received in it: with several
+    /// sources, a copy of an older version of the same slot arriving late must not be published.
+    versions: HashMap<Pubkey, (u64, Vec<u64>)>,
 }
 
 pub async fn run(
@@ -132,7 +139,15 @@ pub async fn run(
     let mut tracker = Tracker {
         feed: match cfg.source.as_str() {
             "grpc" => Feed::Grpc(GrpcSubscriptions::new(&cfg.grpc_url, &cfg.grpc_token, ws_tx)),
-            _ => Feed::Ws(WsSubscriptions::new(&cfg.ws, cfg.max_subscriptions_per_connection, ws_tx)),
+            _ => {
+                let mut urls = vec![cfg.ws.clone()];
+                for url in cfg.extra_ws.iter().filter(|url| !url.is_empty()) {
+                    if !urls.contains(url) {
+                        urls.push(url.clone());
+                    }
+                }
+                Feed::Ws(WsSubscriptions::new(&urls, cfg.max_subscriptions_per_connection, ws_tx))
+            }
         },
         cfg,
         accounts: HashMap::new(),
@@ -156,6 +171,9 @@ pub async fn run(
         latest_slot: 0,
         slot_lag_sum: 0,
         slot_lag_max: 0,
+        first_by_source: Vec::new(),
+        duplicates: 0,
+        versions: HashMap::new(),
     };
 
     let bin_array_refresh = Duration::from_secs(tracker_bin_array_refresh_secs);
@@ -192,7 +210,11 @@ pub async fn run(
 impl Tracker {
     fn on_ws_event(&mut self, event: WsEvent) {
         match event {
-            WsEvent::Account { pubkey, account, slot } => {
+            WsEvent::Account { pubkey, account, slot, source } => {
+                if !self.is_new_version(pubkey, &account, slot) {
+                    self.duplicates += 1;
+                    return;
+                }
                 self.updates += 1;
                 let lag = self.latest_slot.saturating_sub(slot);
                 self.slot_lag_sum += lag;
@@ -204,6 +226,10 @@ impl Tracker {
                 if !self.store(pubkey, account, slot) {
                     return;
                 }
+                if self.first_by_source.len() <= source {
+                    self.first_by_source.resize(source + 1, 0);
+                }
+                self.first_by_source[source] += 1;
                 if !self.batch.is_empty() && slot > self.batch_slot {
                     self.flush();
                 }
@@ -216,7 +242,11 @@ impl Tracker {
                 }
             }
             WsEvent::Slot(slot) => {
-                self.latest_slot = self.latest_slot.max(slot);
+                // Each WebSocket RPC streams the slots: only the first notification of a slot is published.
+                if slot <= self.latest_slot {
+                    return;
+                }
+                self.latest_slot = slot;
                 let _ = self.out.send(Outgoing::Slot(slot));
             }
             WsEvent::Resubscribed(subs) => {
@@ -231,6 +261,25 @@ impl Tracker {
                 let _ = self.jobs.send(Job::Refresh(keys));
             }
         }
+    }
+
+    /// False when this version of the account was already received in this slot (from any source).
+    fn is_new_version(&mut self, pubkey: Pubkey, account: &RawAccount, slot: u64) -> bool {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        account.owner.hash(&mut hasher);
+        account.data.hash(&mut hasher);
+        let hash = hasher.finish();
+        let (latest_slot, hashes) = self.versions.entry(pubkey).or_insert((slot, Vec::new()));
+        if slot > *latest_slot {
+            *latest_slot = slot;
+            hashes.clear();
+        } else if slot == *latest_slot && hashes.contains(&hash) {
+            return false;
+        }
+        if slot == *latest_slot {
+            hashes.push(hash);
+        }
+        true
     }
 
     /// Keeps the most recent version of an account. Returns false when `slot` is older than the cached one.
@@ -540,7 +589,8 @@ impl Tracker {
     fn log_stats(&mut self) {
         info!(
             "Stats: {} pools followed ({} pools seen, {} rejected), {} subscriptions on {} connections, \
-             last minute: {} updates (slot lag avg {:.2}, max {}), {} messages; {} transactions scanned in total",
+             last minute: {} updates (slot lag avg {:.2}, max {}; first from {}; {} duplicates dropped), {} messages; \
+             {} transactions scanned in total",
             self.active.len(),
             self.seen.len(),
             self.invalid.len(),
@@ -549,6 +599,14 @@ impl Tracker {
             self.updates,
             self.slot_lag_sum as f64 / self.updates.max(1) as f64,
             self.slot_lag_max,
+            self.feed
+                .source_names()
+                .iter()
+                .enumerate()
+                .map(|(source, name)| format!("{name}: {}", self.first_by_source.get(source).copied().unwrap_or(0)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.duplicates,
             self.messages,
             TRANSACTIONS_SCANNED.load(Ordering::Relaxed),
         );
@@ -556,5 +614,7 @@ impl Tracker {
         self.messages = 0;
         self.slot_lag_sum = 0;
         self.slot_lag_max = 0;
+        self.first_by_source.clear();
+        self.duplicates = 0;
     }
 }

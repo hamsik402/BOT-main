@@ -17,6 +17,10 @@ pub struct FeedBridgeConfig {
     pub source: String,
     /// WebSocket RPC used to stream the account updates (source = "ws").
     pub ws: String,
+    /// More WebSocket RPCs streaming the same subscriptions at the same time as `ws` (e.g. Helius
+    /// in `ws` and QuickNode here): the first copy of each update is published, the later ones
+    /// are dropped. Each one must accept all the subscriptions.
+    pub extra_ws: Vec<String>,
     /// Yellowstone gRPC endpoint (source = "grpc"), e.g. https://grpc.ny.shyft.to
     pub grpc_url: String,
     /// x-token of the gRPC endpoint.
@@ -55,6 +59,7 @@ impl Default for FeedBridgeConfig {
             bin_array_radius: 5,
             source: "ws".to_string(),
             ws: String::new(),
+            extra_ws: Vec::new(),
             grpc_url: String::new(),
             grpc_token: String::new(),
             bin_array_refresh_secs: 300,

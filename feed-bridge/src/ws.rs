@@ -1,5 +1,6 @@
 //! WebSocket subscriptions (accountSubscribe, programSubscribe, slotSubscribe), spread over several
-//! connections when one is full, with automatic reconnection.
+//! connections when one is full, with automatic reconnection. With several WebSocket RPCs, every
+//! subscription is made on each of them and the tracker keeps the first copy of each update.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -36,28 +37,44 @@ pub enum Sub {
 
 #[derive(Debug)]
 pub enum WsEvent {
-    Account { pubkey: Pubkey, account: RawAccount, slot: u64 },
+    /// `source`: index of the WebSocket RPC (or 0 for gRPC) the update came from.
+    Account {
+        pubkey: Pubkey,
+        account: RawAccount,
+        slot: u64,
+        source: usize,
+    },
     Slot(u64),
     /// A connection (re)started with these subscriptions: updates may have been missed since they
     /// were requested.
     Resubscribed(Vec<Sub>),
 }
 
-pub struct WsSubscriptions {
+/// Connections to one WebSocket RPC.
+struct Endpoint {
     url: String,
-    max_per_connection: usize,
     /// Number of subscriptions and command channel of each connection.
     connections: Vec<(usize, UnboundedSender<Sub>)>,
+}
+
+pub struct WsSubscriptions {
+    endpoints: Vec<Endpoint>,
+    max_per_connection: usize,
     subscribed: HashSet<Sub>,
     events: UnboundedSender<WsEvent>,
 }
 
 impl WsSubscriptions {
-    pub fn new(url: &str, max_per_connection: usize, events: UnboundedSender<WsEvent>) -> Self {
+    pub fn new(urls: &[String], max_per_connection: usize, events: UnboundedSender<WsEvent>) -> Self {
         WsSubscriptions {
-            url: url.to_string(),
+            endpoints: urls
+                .iter()
+                .map(|url| Endpoint {
+                    url: url.clone(),
+                    connections: Vec::new(),
+                })
+                .collect(),
             max_per_connection: max_per_connection.max(1),
-            connections: Vec::new(),
             subscribed: HashSet::new(),
             events,
         }
@@ -68,37 +85,53 @@ impl WsSubscriptions {
     }
 
     pub fn connections(&self) -> usize {
-        self.connections.len()
+        self.endpoints.iter().map(|endpoint| endpoint.connections.len()).sum()
+    }
+
+    /// Host of each WebSocket RPC (without the API key), by source index.
+    pub fn source_names(&self) -> Vec<String> {
+        self.endpoints.iter().map(|endpoint| host(&endpoint.url)).collect()
     }
 
     pub fn subscribe(&mut self, sub: Sub) {
         if !self.subscribed.insert(sub) {
             return;
         }
-        let index = match self
-            .connections
-            .iter()
-            .position(|(count, _)| *count < self.max_per_connection)
-        {
-            Some(index) => index,
-            None => {
-                let (tx, rx) = unbounded_channel();
-                let index = self.connections.len();
-                // The first connection also streams the slots.
-                tokio::spawn(run_connection(self.url.clone(), index, index == 0, rx, self.events.clone()));
-                self.connections.push((0, tx));
-                index
-            }
-        };
-        let (count, tx) = &mut self.connections[index];
-        *count += 1;
-        let _ = tx.send(sub);
+        for (source, endpoint) in self.endpoints.iter_mut().enumerate() {
+            let index = match endpoint
+                .connections
+                .iter()
+                .position(|(count, _)| *count < self.max_per_connection)
+            {
+                Some(index) => index,
+                None => {
+                    let (tx, rx) = unbounded_channel();
+                    let index = endpoint.connections.len();
+                    // The first connection of each endpoint also streams the slots.
+                    let name = format!("{}#{index}", host(&endpoint.url));
+                    tokio::spawn(run_connection(endpoint.url.clone(), name, source, index == 0, rx, self.events.clone()));
+                    endpoint.connections.push((0, tx));
+                    index
+                }
+            };
+            let (count, tx) = &mut endpoint.connections[index];
+            *count += 1;
+            let _ = tx.send(sub);
+        }
     }
+}
+
+/// `wss://host/path?api-key=...` -> `host`, for the logs.
+fn host(url: &str) -> String {
+    let start = url.find("://").map_or(0, |index| index + 3);
+    let end = url[start..].find(['/', '?']).map_or(url.len(), |index| start + index);
+    url[start..end].to_string()
 }
 
 async fn run_connection(
     url: String,
-    index: usize,
+    index: String,
+    source: usize,
     with_slots: bool,
     mut new_subs: UnboundedReceiver<Sub>,
     events: UnboundedSender<WsEvent>,
@@ -113,7 +146,7 @@ async fn run_connection(
             Ok(Ok((stream, _))) => {
                 info!("WS[{index}]: connected, {} subscriptions", subs.len());
                 let started = std::time::Instant::now();
-                match serve(stream, with_slots, &mut subs, &mut new_subs, &events).await {
+                match serve(stream, source, with_slots, &mut subs, &mut new_subs, &events).await {
                     Ok(()) => return,
                     Err(e) => warn!("WS[{index}]: {e:#}"),
                 }
@@ -133,6 +166,7 @@ async fn run_connection(
 /// or the bridge stops (Ok).
 async fn serve(
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    source: usize,
     with_slots: bool,
     subs: &mut Vec<Sub>,
     new_subs: &mut UnboundedReceiver<Sub>,
@@ -170,7 +204,7 @@ async fn serve(
             }
             message = read.next() => match message {
                 Some(Ok(Message::Text(text))) => {
-                    if !handle_text(&text, &mut pending, &mut active, events) {
+                    if !handle_text(&text, source, &mut pending, &mut active, events) {
                         return Ok(());
                     }
                 }
@@ -187,6 +221,7 @@ async fn serve(
 /// Returns false when nobody listens to the events any more.
 fn handle_text(
     text: &str,
+    source: usize,
     pending: &mut HashMap<u64, Sub>,
     active: &mut HashMap<u64, Sub>,
     events: &UnboundedSender<WsEvent>,
@@ -220,6 +255,7 @@ fn handle_text(
                 pubkey: *pubkey,
                 account,
                 slot: result["context"]["slot"].as_u64().unwrap_or(0),
+                source,
             }
         }
         Some("programNotification") => {
@@ -231,6 +267,7 @@ fn handle_text(
                 pubkey,
                 account,
                 slot: result["context"]["slot"].as_u64().unwrap_or(0),
+                source,
             }
         }
         Some("slotNotification") => {
@@ -305,6 +342,13 @@ impl Feed {
         }
     }
 
+    pub fn source_names(&self) -> Vec<String> {
+        match self {
+            Feed::Ws(ws) => ws.source_names(),
+            Feed::Grpc(_) => vec!["grpc".to_string()],
+        }
+    }
+
     /// The gRPC source cannot filter bin arrays by pool: each one is subscribed by address.
     pub fn follows_bin_arrays_by_address(&self) -> bool {
         matches!(self, Feed::Grpc(_))
@@ -313,7 +357,14 @@ impl Feed {
 
 #[cfg(test)]
 mod tests {
-    use super::with_root_path;
+    use super::{host, with_root_path};
+
+    #[test]
+    fn host_hides_the_api_key() {
+        assert_eq!(host("wss://mainnet.helius-rpc.com/?api-key=k"), "mainnet.helius-rpc.com");
+        assert_eq!(host("wss://x.solana-mainnet.quiknode.pro/token/"), "x.solana-mainnet.quiknode.pro");
+        assert_eq!(host("ws://host.com:8900"), "host.com:8900");
+    }
 
     #[test]
     fn adds_the_root_path_before_the_query() {

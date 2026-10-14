@@ -185,6 +185,7 @@ where
                 pubkey,
                 account: RawAccount { owner, data: info.data },
                 slot: update.slot,
+                source: 0,
             }
         }
         Some(UpdateOneof::Slot(slot)) => WsEvent::Slot(slot.slot),
